@@ -1,213 +1,343 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import {
-  fetchGroups,
-  predictMatch,
-  type Groups,
-  type Prediction,
-} from "@/lib/api";
+import { useEffect, useRef, useState } from "react";
+import { fetchGroups, fetchSchedule, predictMatch } from "@/lib/api";
+import type { Fixture, Groups, Prediction } from "@/lib/types";
+import { calculateStandings } from "@/lib/standings";
+import type { CompletedMatch } from "@/lib/standings";
+import GroupTable from "@/components/GroupTable";
+import KnockoutBracket from "@/components/KnockoutBracket";
+import MatchCard from "@/components/MatchCard";
+
+const STORAGE_KEY = "wc2026_sim_v1";
+
+type SimState = {
+  completedMatches: CompletedMatch[];
+  currentIndex: number;
+};
+
+const INITIAL_STATE: SimState = { completedMatches: [], currentIndex: 0 };
 
 export default function Home() {
   const [groups, setGroups] = useState<Groups>({});
-  const [homeTeam, setHomeTeam] = useState("");
-  const [awayTeam, setAwayTeam] = useState("");
-  const [result, setResult] = useState<Prediction | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [schedule, setSchedule] = useState<Fixture[]>([]);
+  const [dataLoading, setDataLoading] = useState(true);
+  const [dataError, setDataError] = useState<string | null>(null);
 
-  // Load the group -> teams map once for both dropdowns.
+  const [sim, setSim] = useState<SimState>(INITIAL_STATE);
+  const [prediction, setPrediction] = useState<Prediction | null>(null);
+  const [predLoading, setPredLoading] = useState(false);
+  const [predError, setPredError] = useState<string | null>(null);
+
+  const [simAllLoading, setSimAllLoading] = useState(false);
+
+  const [confirmReset, setConfirmReset] = useState(false);
+  const resetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Restore from localStorage once on mount.
   useEffect(() => {
-    fetchGroups()
-      .then(setGroups)
-      .catch(() => setError("Could not reach the prediction server."));
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) setSim(JSON.parse(saved) as SimState);
+    } catch {
+      // Corrupt storage — start fresh.
+    }
   }, []);
 
-  const sameTeam = homeTeam !== "" && homeTeam === awayTeam;
-  const canPredict = homeTeam !== "" && awayTeam !== "" && !sameTeam && !loading;
+  // Persist on every sim change.
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(sim));
+  }, [sim]);
 
-  async function onPredict() {
-    if (!canPredict) return;
-    setLoading(true);
-    setError(null);
+  // Load schedule + groups from FastAPI once.
+  useEffect(() => {
+    Promise.all([fetchGroups(), fetchSchedule()])
+      .then(([g, s]) => {
+        setGroups(g);
+        setSchedule(s);
+      })
+      .catch(() =>
+        setDataError(
+          "Could not reach the prediction server. Make sure the FastAPI backend is running on port 8000.",
+        ),
+      )
+      .finally(() => setDataLoading(false));
+  }, []);
+
+  const currentFixture: Fixture | null = schedule[sim.currentIndex] ?? null;
+  const isComplete =
+    schedule.length > 0 && sim.currentIndex >= schedule.length;
+  const progress =
+    schedule.length > 0 ? (sim.currentIndex / schedule.length) * 100 : 0;
+
+  const currentMatchday = currentFixture?.matchday ?? "";
+  const standings = calculateStandings(sim.completedMatches, groups);
+
+  // Group completed matches by matchday for the "Recent" section.
+  const recentMatches = sim.completedMatches.slice(-6).reverse();
+
+  async function handleSimulateAll() {
+    const remaining = schedule.slice(sim.currentIndex);
+    if (remaining.length === 0 || simAllLoading) return;
+    setSimAllLoading(true);
+    setPredError(null);
     try {
-      setResult(await predictMatch(homeTeam, awayTeam));
+      // Fan all predictions out in parallel — they're stateless model calls.
+      const results = await Promise.allSettled(
+        remaining.map((f) => predictMatch(f.home_team, f.away_team)),
+      );
+      const newMatches: CompletedMatch[] = [];
+      results.forEach((r, i) => {
+        if (r.status === "fulfilled") {
+          newMatches.push({
+            fixture: remaining[i],
+            home_score: r.value.home_score,
+            away_score: r.value.away_score,
+            expected_goals_home: r.value.expected_goals_home,
+            expected_goals_away: r.value.expected_goals_away,
+          });
+        }
+      });
+      setSim((prev) => ({
+        completedMatches: [...prev.completedMatches, ...newMatches],
+        currentIndex: prev.currentIndex + newMatches.length,
+      }));
+      setPrediction(null);
     } catch (e) {
-      setResult(null);
-      setError(e instanceof Error ? e.message : "Prediction failed.");
+      setPredError(e instanceof Error ? e.message : "Simulation failed.");
     } finally {
-      setLoading(false);
+      setSimAllLoading(false);
     }
+  }
+
+  async function handlePredict() {
+    if (!currentFixture || predLoading) return;
+    setPredLoading(true);
+    setPredError(null);
+    try {
+      setPrediction(await predictMatch(currentFixture.home_team, currentFixture.away_team));
+    } catch (e) {
+      setPredError(e instanceof Error ? e.message : "Prediction failed.");
+    } finally {
+      setPredLoading(false);
+    }
+  }
+
+  function handleNext() {
+    if (!prediction || !currentFixture) return;
+    const match: CompletedMatch = {
+      fixture: currentFixture,
+      home_score: prediction.home_score,
+      away_score: prediction.away_score,
+      expected_goals_home: prediction.expected_goals_home,
+      expected_goals_away: prediction.expected_goals_away,
+    };
+    setSim((prev) => ({
+      completedMatches: [...prev.completedMatches, match],
+      currentIndex: prev.currentIndex + 1,
+    }));
+    setPrediction(null);
+    setPredError(null);
+  }
+
+  function handleResetClick() {
+    if (!confirmReset) {
+      setConfirmReset(true);
+      // Auto-cancel confirmation after 4 s.
+      resetTimerRef.current = setTimeout(() => setConfirmReset(false), 4000);
+      return;
+    }
+    if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
+    setConfirmReset(false);
+    setSim(INITIAL_STATE);
+    setPrediction(null);
+    setPredError(null);
+    localStorage.removeItem(STORAGE_KEY);
+  }
+
+  if (dataLoading) {
+    return (
+      <div className="flex min-h-[40vh] items-center justify-center text-slate-400">
+        Loading schedule…
+      </div>
+    );
+  }
+
+  if (dataError) {
+    return (
+      <div className="rounded-2xl border border-red-200 bg-red-50 p-8 text-center">
+        <p className="font-semibold text-red-700">Server unreachable</p>
+        <p className="mt-1 text-sm text-red-500">{dataError}</p>
+      </div>
+    );
   }
 
   return (
     <div className="space-y-8">
-      <section className="space-y-2">
-        <h1 className="text-3xl font-semibold tracking-tight text-slate-900">
-          Single Match Predictor
-        </h1>
-        <p className="text-slate-500">
-          Pick two nations from the group stage and let the model call the
-          scoreline.
-        </p>
-      </section>
-
-      <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-card sm:p-8">
-        <div className="grid items-end gap-4 sm:grid-cols-[1fr_auto_1fr]">
-          <TeamSelect
-            label="Home"
-            value={homeTeam}
-            groups={groups}
-            disabledTeam={awayTeam}
-            onChange={setHomeTeam}
-          />
-
-          <div className="hidden pb-3 text-center text-sm font-semibold uppercase tracking-wide text-slate-400 sm:block">
-            vs
-          </div>
-
-          <TeamSelect
-            label="Away"
-            value={awayTeam}
-            groups={groups}
-            disabledTeam={homeTeam}
-            onChange={setAwayTeam}
-          />
+      {/* ── Page header ─────────────────────────────────────────── */}
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight text-slate-900">
+            Group Stage Simulation
+          </h1>
+          <p className="mt-1 text-sm text-slate-500">
+            {isComplete
+              ? "All 72 group-stage matches simulated."
+              : `Match ${sim.currentIndex + 1} of ${schedule.length} · Matchday ${currentMatchday}`}
+          </p>
         </div>
+        <div className="flex items-center gap-2">
+          {!isComplete && (
+            <button
+              onClick={handleSimulateAll}
+              disabled={simAllLoading || isComplete}
+              className="mt-1 rounded-lg bg-pitch-600 px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition hover:bg-pitch-700 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
+            >
+              {simAllLoading ? "Simulating…" : "Simulate All"}
+            </button>
+          )}
+          <button
+            onClick={handleResetClick}
+            disabled={simAllLoading}
+            className={`mt-1 rounded-lg px-3 py-1.5 text-xs font-medium transition disabled:opacity-40 ${
+              confirmReset
+                ? "bg-red-100 text-red-600 hover:bg-red-200"
+                : "text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+            }`}
+          >
+            {confirmReset ? "Tap again to reset" : "Reset"}
+          </button>
+        </div>
+      </div>
 
-        {sameTeam && (
-          <p className="mt-3 text-sm text-amber-600">
-            Choose two different teams.
+      {/* ── Progress bar ────────────────────────────────────────── */}
+      <div className="h-1.5 overflow-hidden rounded-full bg-slate-100">
+        <div
+          className="h-full rounded-full bg-pitch-500 transition-all duration-500"
+          style={{ width: `${progress}%` }}
+        />
+      </div>
+
+      {/* ── Current match predictor ──────────────────────────────── */}
+      {isComplete ? (
+        <div className="rounded-2xl border border-pitch-100 bg-pitch-50 px-8 py-12 text-center">
+          <div className="text-4xl">🏆</div>
+          <p className="mt-3 text-xl font-bold text-pitch-700">
+            Group Stage Complete!
           </p>
-        )}
-
-        <button
-          onClick={onPredict}
-          disabled={!canPredict}
-          className="mt-6 w-full rounded-xl bg-pitch-600 px-5 py-3 text-base font-semibold text-white shadow-sm transition hover:bg-pitch-700 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
-        >
-          {loading ? "Simulating…" : "Predict Match"}
-        </button>
-
-        {error && (
-          <p className="mt-4 rounded-lg bg-red-50 px-4 py-3 text-sm text-red-600">
-            {error}
+          <p className="mt-1 text-sm text-slate-500">
+            All 72 matches have been simulated. Check the final standings below.
           </p>
-        )}
-      </section>
+          <button
+            onClick={handleResetClick}
+            className="mt-6 rounded-xl border border-pitch-200 px-5 py-2.5 text-sm font-semibold text-pitch-700 transition hover:bg-pitch-100"
+          >
+            Simulate Again
+          </button>
+        </div>
+      ) : currentFixture ? (
+        <div className="mx-auto max-w-2xl">
+          <MatchCard
+            fixture={currentFixture}
+            prediction={prediction}
+            loading={predLoading}
+            error={predError}
+            onPredict={handlePredict}
+            onNext={handleNext}
+          />
 
-      {result && <ResultCard result={result} />}
-    </div>
-  );
-}
+          {/* Up next preview */}
+          {schedule[sim.currentIndex + 1] && (
+            <UpNext fixtures={schedule.slice(sim.currentIndex + 1, sim.currentIndex + 4)} />
+          )}
+        </div>
+      ) : null}
 
-function TeamSelect({
-  label,
-  value,
-  groups,
-  disabledTeam,
-  onChange,
-}: {
-  label: string;
-  value: string;
-  groups: Groups;
-  disabledTeam: string;
-  onChange: (team: string) => void;
-}) {
-  const groupLetters = useMemo(() => Object.keys(groups).sort(), [groups]);
-
-  return (
-    <label className="block">
-      <span className="mb-1.5 block text-sm font-medium text-slate-600">
-        {label}
-      </span>
-      <select
-        className="select-field"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-      >
-        <option value="">Select a team…</option>
-        {groupLetters.map((letter) => (
-          <optgroup key={letter} label={`Group ${letter}`}>
-            {groups[letter].map((team) => (
-              <option key={team} value={team} disabled={team === disabledTeam}>
-                {team}
-              </option>
+      {/* ── Recent results strip ─────────────────────────────────── */}
+      {recentMatches.length > 0 && (
+        <section className="space-y-3">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-400">
+            Recent Results
+          </h2>
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {recentMatches.map((m, i) => (
+              <RecentResult key={i} match={m} />
             ))}
-          </optgroup>
-        ))}
-      </select>
-    </label>
-  );
-}
-
-function ResultCard({ result }: { result: Prediction }) {
-  const homeShare =
-    result.total_predicted_goals > 0
-      ? (result.expected_goals_home / result.total_predicted_goals) * 100
-      : 50;
-
-  const verdict =
-    result.home_score > result.away_score
-      ? `${result.home_team} win`
-      : result.away_score > result.home_score
-        ? `${result.away_team} win`
-        : "Draw";
-
-  return (
-    <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-card sm:p-8">
-      <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-4">
-        <TeamColumn name={result.home_team} align="text-right" />
-        <div className="text-center">
-          <div className="text-4xl font-bold tracking-tight text-slate-900 sm:text-5xl">
-            {result.home_score}
-            <span className="mx-2 text-slate-300">–</span>
-            {result.away_score}
           </div>
-          <div className="mt-1 text-xs font-medium uppercase tracking-wide text-pitch-600">
-            {verdict}
-          </div>
-        </div>
-        <TeamColumn name={result.away_team} align="text-left" />
-      </div>
+        </section>
+      )}
 
-      {/* Expected-goals split bar */}
-      <div className="mt-6">
-        <div className="flex justify-between text-xs font-medium text-slate-500">
-          <span>xG {result.expected_goals_home.toFixed(2)}</span>
-          <span>xG {result.expected_goals_away.toFixed(2)}</span>
+      {/* ── Group standings ──────────────────────────────────────── */}
+      <section className="space-y-4">
+        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-400">
+          Group Standings
+        </h2>
+        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          {Object.keys(groups)
+            .sort()
+            .map((group) => (
+              <GroupTable
+                key={group}
+                group={group}
+                teams={standings[group] ?? []}
+              />
+            ))}
         </div>
-        <div className="mt-1.5 flex h-2.5 overflow-hidden rounded-full bg-slate-100">
-          <div
-            className="bg-pitch-500"
-            style={{ width: `${homeShare}%` }}
-            aria-hidden
-          />
-          <div className="flex-1 bg-slate-300" aria-hidden />
+      </section>
+
+      {/* ── Knockout bracket — unlocks after all 72 group matches ── */}
+      {isComplete && (
+        <div className="border-t border-slate-200 pt-8">
+          <KnockoutBracket standings={standings} />
         </div>
-      </div>
-
-      <div className="mt-6 grid grid-cols-2 gap-3 text-center sm:grid-cols-2">
-        <Stat label="Total goals" value={result.total_predicted_goals.toFixed(2)} />
-        <Stat label="Rating gap" value={result.rating_gap.toFixed(2)} />
-      </div>
-    </section>
-  );
-}
-
-function TeamColumn({ name, align }: { name: string; align: string }) {
-  return (
-    <div className={align}>
-      <p className="text-lg font-semibold text-slate-900">{name}</p>
+      )}
     </div>
   );
 }
 
-function Stat({ label, value }: { label: string; value: string }) {
+function UpNext({ fixtures }: { fixtures: Fixture[] }) {
   return (
-    <div className="rounded-xl bg-slate-50 px-4 py-3">
-      <p className="text-xl font-semibold text-slate-900">{value}</p>
-      <p className="text-xs uppercase tracking-wide text-slate-400">{label}</p>
+    <div className="mt-3 space-y-1.5">
+      <p className="text-xs font-medium uppercase tracking-wide text-slate-400">
+        Coming up
+      </p>
+      {fixtures.map((f, i) => (
+        <div
+          key={i}
+          className="flex items-center justify-between rounded-xl border border-slate-100 bg-white/60 px-4 py-2.5 text-sm"
+        >
+          <span className="flex items-center gap-2 text-slate-500">
+            <span className="flex h-5 w-5 items-center justify-center rounded-md bg-slate-100 text-[10px] font-bold text-slate-500">
+              {f.group}
+            </span>
+            <span>{f.date} · MD{f.matchday}</span>
+          </span>
+          <span className="font-medium text-slate-700">
+            {f.home_team}{" "}
+            <span className="text-slate-300">vs</span> {f.away_team}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function RecentResult({ match }: { match: CompletedMatch }) {
+  const { fixture: f, home_score, away_score } = match;
+  const homeWon = home_score > away_score;
+  const awayWon = away_score > home_score;
+
+  return (
+    <div className="flex items-center justify-between rounded-xl border border-slate-100 bg-white px-4 py-3 text-sm shadow-sm">
+      <span className={`flex-1 truncate text-right font-medium ${homeWon ? "text-pitch-700" : "text-slate-500"}`}>
+        {f.home_team}
+      </span>
+      <span className="mx-3 shrink-0 rounded-lg bg-slate-50 px-3 py-1 text-center text-base font-bold tabular-nums text-slate-800">
+        {home_score} – {away_score}
+      </span>
+      <span className={`flex-1 truncate text-left font-medium ${awayWon ? "text-pitch-700" : "text-slate-500"}`}>
+        {f.away_team}
+      </span>
     </div>
   );
 }

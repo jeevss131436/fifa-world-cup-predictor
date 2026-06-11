@@ -95,7 +95,8 @@ def groups() -> dict[str, dict[str, list[str]]]:
 @app.get("/schedule")
 def schedule() -> dict[str, list[dict[str, str]]]:
     """All group-stage fixtures in chronological order, as listed in the CSV."""
-    fixtures = group_stage_matches().to_dict(orient="records")
+    df = group_stage_matches().rename(columns={"time (EST)": "time_est"})
+    fixtures = df.to_dict(orient="records")
     return {"fixtures": fixtures}
 
 

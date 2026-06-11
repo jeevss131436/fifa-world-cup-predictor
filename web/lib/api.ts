@@ -1,19 +1,6 @@
-// Thin client for the FastAPI backend. Every call goes through the Next.js
-// rewrite (/api/py/* -> FastAPI), so there is no CORS and no hard-coded host.
+import type { Fixture, Groups, Prediction } from "./types";
 
-export type Prediction = {
-  home_team: string;
-  away_team: string;
-  home_score: number;
-  away_score: number;
-  expected_goals_home: number;
-  expected_goals_away: number;
-  total_predicted_goals: number;
-  rating_gap: number;
-};
-
-// Group letter (A-L) -> teams in that group.
-export type Groups = Record<string, string[]>;
+export type { Fixture, Groups, Prediction };
 
 async function getJson<T>(path: string): Promise<T> {
   const res = await fetch(`/api/py${path}`, { cache: "no-store" });
@@ -24,6 +11,11 @@ async function getJson<T>(path: string): Promise<T> {
 export async function fetchGroups(): Promise<Groups> {
   const data = await getJson<{ groups: Groups }>("/groups");
   return data.groups;
+}
+
+export async function fetchSchedule(): Promise<Fixture[]> {
+  const data = await getJson<{ fixtures: Fixture[] }>("/schedule");
+  return data.fixtures;
 }
 
 export async function predictMatch(
@@ -38,9 +30,9 @@ export async function predictMatch(
   if (!res.ok) {
     const detail = await res
       .json()
-      .then((d) => d.detail)
+      .then((d: { detail?: string }) => d.detail)
       .catch(() => null);
-    throw new Error(detail || `Prediction failed (${res.status})`);
+    throw new Error(detail ?? `Prediction failed (${res.status})`);
   }
   return res.json();
 }

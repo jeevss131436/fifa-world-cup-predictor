@@ -81,12 +81,17 @@ def get_match_prediction(home_team, away_team):
     home_predicted_goals = predicted_total_goals * (home_scaled_power / total_power)
     away_predicted_goals = predicted_total_goals * (away_scaled_power / total_power)
     
-    # Return everything as a dictionary (perfect for converting to JSON!)
+    # Sample integer scores from a Poisson distribution so repeated simulations
+    # of the same fixture produce different results. The xG values remain the
+    # deterministic expected goals (λ) and are returned separately for display.
+    home_score = int(np.random.poisson(max(0.05, home_predicted_goals)))
+    away_score = int(np.random.poisson(max(0.05, away_predicted_goals)))
+
     return {
         "home_team": home_team,
         "away_team": away_team,
-        "home_score": round(home_predicted_goals),
-        "away_score": round(away_predicted_goals),
+        "home_score": home_score,
+        "away_score": away_score,
         "expected_goals_home": round(home_predicted_goals, 2),
         "expected_goals_away": round(away_predicted_goals, 2),
         "total_predicted_goals": round(predicted_total_goals, 2),
