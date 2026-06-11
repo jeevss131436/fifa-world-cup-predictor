@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Generated processed datasets (rebuild with: python backend/preprocess.py)
+data/squad_values.csv
+data/processed_momentum.csv
+data/processed_squad_strength.csv
+
+# Node / Next.js (web has its own .gitignore too)
+node_modules/
+.next/
+
+# Editor / OS
+.DS_Store
